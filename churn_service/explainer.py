@@ -1,11 +1,14 @@
-"""Phase 3.1–3.2: reasoning layer — map ML outputs to LLM explanations via LiteLLM.
+"""Phase 3.1–3.3: reasoning layer — map ML outputs to LLM explanations via LiteLLM.
 
 Loads champion predictions + Phase 2 top features, formats business-facing evidence from
 raw feature values, and calls an OpenAI or OpenRouter model through LiteLLM (model-agnostic).
+Phase 3.3 adds LLM-as-a-Judge faithfulness validation (RAGAS-style grounding check) and
+temperature backoff when the judge flags unsupported claims.
 
 Environment (typical):
   - ``OPENAI_API_KEY`` for OpenAI models (default ``LLM_MODEL=gpt-4o-mini``).
   - ``OPENROUTER_API_KEY`` and ``LLM_MODEL=openrouter/<provider>/<model>`` for OpenRouter.
+  - ``JUDGE_MODEL`` (optional): model used only for validation; defaults to ``LLM_MODEL``.
 
 From the repository root, using a virtual environment (recommended)::
 
@@ -20,6 +23,7 @@ import json
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -65,6 +69,75 @@ Rules:
 
 def _default_model() -> str:
     return os.environ.get("LLM_MODEL", "gpt-4o-mini")
+
+
+def _default_judge_model() -> str:
+    return os.environ.get("JUDGE_MODEL") or _default_model()
+
+
+@dataclass
+class ValidationResult:
+    """Structured output from the LLM-as-a-Judge faithfulness check (Phase 3.3)."""
+
+    faithfulness_score: int
+    valid: bool
+    reason: str | None = None
+    raw_response: str | None = None
+    judge_failed: bool = False
+
+
+_JUDGE_SYSTEM_PROMPT = """You are a strict fact-checker for customer churn explanations.
+Compare the explanation to the raw customer data (JSON). Determine whether the explanation
+mentions any specific facts, numbers, categories, or attributes that are NOT present in that data.
+General qualitative paraphrases of values that appear in the data are acceptable.
+Answer with a Faithfulness Score from 1 (many fabricated or unsupported specifics) to 5 (fully grounded).
+Set valid to true only if the explanation does not introduce fabricated metrics or attributes and is adequately grounded in the data (typically score 4 or 5).
+Respond with JSON only, no markdown: {"faithfulness_score": <1-5 int>, "valid": <bool>, "reason": "<brief rationale>"}"""
+
+
+def _json_safe_scalar(val: Any) -> Any:
+    if isinstance(val, np.generic):
+        return val.item()
+    return val
+
+
+def _grounding_payload_for_judge(prediction_data: dict[str, Any]) -> dict[str, Any]:
+    features = prediction_data.get("features")
+    if not isinstance(features, Mapping):
+        raise ValueError("prediction_data['features'] must be a mapping for validation.")
+    raw_features = {str(k): _json_safe_scalar(v) for k, v in features.items()}
+    pred = prediction_data.get("predicted_churn", 0)
+    pred_int = int(pred) if not isinstance(pred, bool) else int(pred)
+    return {
+        "customer_id": prediction_data.get("customer_id"),
+        "churn_probability": float(prediction_data.get("churn_probability", 0.0)),
+        "predicted_churn": pred_int,
+        "features": raw_features,
+    }
+
+
+def _parse_judge_json(text: str) -> dict[str, Any]:
+    text = text.strip()
+    try:
+        out = json.loads(text)
+        if isinstance(out, dict):
+            return out
+        raise ValueError("expected JSON object")
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            out = json.loads(text[start : end + 1])
+            if isinstance(out, dict):
+                return out
+        raise
+
+
+def _attempt_temperatures(initial_temperature: float, max_attempts: int) -> list[float]:
+    seq = [initial_temperature, initial_temperature * 0.5, 0.0]
+    if max_attempts <= len(seq):
+        return seq[:max_attempts]
+    return seq + [0.0] * (max_attempts - len(seq))
 
 
 def _parse_transformed_feature_name(engineered_name: str) -> tuple[str, str | None]:
@@ -174,6 +247,176 @@ def generate_explanation(
     return str(text).strip()
 
 
+def validate_explanation(
+    explanation: str,
+    prediction_data: dict[str, Any],
+    *,
+    model: str | None = None,
+    attempt: int = 1,
+) -> ValidationResult:
+    """LLM-as-a-Judge: compare ``explanation`` to raw ``prediction_data`` for grounding.
+
+    Uses ``JUDGE_MODEL`` when set, otherwise ``LLM_MODEL``. On judge API or parse failure,
+    returns ``judge_failed=True`` so callers can fall back without blocking the pipeline.
+    """
+    use_model = model or _default_judge_model()
+    grounding = _grounding_payload_for_judge(prediction_data)
+    user_content = json.dumps(
+        {
+            "explanation_to_evaluate": explanation,
+            "raw_customer_data": grounding,
+            "instruction": (
+                "Compare this explanation to the raw data provided. Does the explanation mention "
+                "any facts or numbers NOT present in the data? Answer with a Faithfulness Score "
+                "from 1-5 and a Boolean Valid flag in JSON: faithfulness_score, valid, reason."
+            ),
+        },
+        indent=2,
+    )
+    messages = [
+        {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    try:
+        try:
+            resp = completion(
+                model=use_model,
+                messages=messages,
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+        except Exception as first_err:
+            _LOGGER.debug("Judge JSON mode failed (%s); retrying without response_format.", first_err)
+            resp = completion(model=use_model, messages=messages, temperature=0.0)
+    except Exception as e:
+        _LOGGER.warning("Judge completion failed: %s", e)
+        return ValidationResult(
+            faithfulness_score=0,
+            valid=False,
+            reason=str(e),
+            judge_failed=True,
+        )
+
+    choice = resp.choices[0].message
+    raw = str(getattr(choice, "content", None) or "").strip()
+    try:
+        parsed = _parse_judge_json(raw)
+    except (json.JSONDecodeError, ValueError) as e:
+        _LOGGER.warning("Judge returned unparseable JSON: %s", e)
+        return ValidationResult(
+            faithfulness_score=0,
+            valid=False,
+            reason=f"judge_parse_error: {e}",
+            raw_response=raw,
+            judge_failed=True,
+        )
+
+    score_raw = parsed.get("faithfulness_score")
+    try:
+        score = int(score_raw) if score_raw is not None else 1
+    except (TypeError, ValueError):
+        score = 1
+    score = max(1, min(5, score))
+    valid = bool(parsed.get("valid", False))
+    reason = parsed.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        reason = str(reason)
+
+    cid = prediction_data.get("customer_id", "unknown")
+    _LOGGER.info(
+        "explanation_validation customer_id=%s faithfulness_score=%s valid=%s attempt=%s judge_model=%s",
+        cid,
+        score,
+        valid,
+        attempt,
+        use_model,
+    )
+
+    return ValidationResult(
+        faithfulness_score=score,
+        valid=valid,
+        reason=reason,
+        raw_response=raw,
+        judge_failed=False,
+    )
+
+
+def explain_with_validation(
+    prediction_data: dict[str, Any],
+    top_features: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+    judge_model: str | None = None,
+    initial_temperature: float = 0.3,
+    max_attempts: int = 3,
+) -> tuple[str, dict[str, Any]]:
+    """Generate an explanation, validate with the judge, retry with lower temperature if invalid.
+
+    Returns ``(explanation, audit)``. If the judge fails (API/parse), returns the latest
+    explanation with ``audit["validation_skipped"]=True`` so upstream callers can surface
+    a warning without failing the request.
+
+    ``audit`` includes ``attempts`` (per-attempt temperature and validation summary),
+    ``validation_skipped``, ``final_valid`` (whether the judge accepted an explanation), and
+    ``final_attempt``.
+    """
+    temps = _attempt_temperatures(initial_temperature, max_attempts)
+    audit_attempts: list[dict[str, Any]] = []
+    last_explanation = ""
+    validation_skipped_final = False
+    judge_model_resolved = judge_model or _default_judge_model()
+
+    for i, temp in enumerate(temps):
+        attempt_no = i + 1
+        last_explanation = generate_explanation(
+            prediction_data,
+            top_features,
+            model=model,
+            temperature=temp,
+        )
+        vr = validate_explanation(
+            last_explanation,
+            prediction_data,
+            model=judge_model_resolved,
+            attempt=attempt_no,
+        )
+        audit_attempts.append(
+            {
+                "attempt": attempt_no,
+                "temperature": temp,
+                "validation": {
+                    "faithfulness_score": vr.faithfulness_score,
+                    "valid": vr.valid,
+                    "reason": vr.reason,
+                    "judge_failed": vr.judge_failed,
+                },
+            }
+        )
+
+        if vr.judge_failed:
+            validation_skipped_final = True
+            _LOGGER.warning(
+                "Judge unavailable or unparseable; returning last explanation without faithfulness gate (attempt %s).",
+                attempt_no,
+            )
+            break
+
+        if vr.valid:
+            return last_explanation, {
+                "attempts": audit_attempts,
+                "validation_skipped": False,
+                "final_valid": True,
+                "final_attempt": attempt_no,
+            }
+
+    return last_explanation, {
+        "attempts": audit_attempts,
+        "validation_skipped": validation_skipped_final,
+        "final_valid": False,
+        "final_attempt": audit_attempts[-1]["attempt"] if audit_attempts else 0,
+    }
+
+
 def load_top_features(models_dir: Path | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Load ``feature_importance.json`` and return ``top_features`` plus full payload."""
     root = models_dir if models_dir is not None else _CHURN_DIR / "models"
@@ -253,9 +496,18 @@ def demo_console_explanation() -> None:
         )
         return
 
-    print(f"\n--- AI-generated explanation ({_default_model()}) ---\n")
-    explanation = generate_explanation(prediction_data, top_features)
+    print(f"\n--- AI-generated explanation ({_default_model()}) + judge ({_default_judge_model()}) ---\n")
+    explanation, audit = explain_with_validation(prediction_data, top_features)
     print(explanation)
+    print()
+    last_attempt = audit.get("attempts", [{}])[-1]
+    val = last_attempt.get("validation", {})
+    print(
+        "--- Validation summary (faithfulness / rigor) ---\n"
+        f"  final_valid={audit.get('final_valid')} | validation_skipped={audit.get('validation_skipped')} | "
+        f"attempts={len(audit.get('attempts', []))}\n"
+        f"  last faithfulness_score={val.get('faithfulness_score')} | valid={val.get('valid')}"
+    )
     print()
 
 
