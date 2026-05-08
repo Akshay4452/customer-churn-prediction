@@ -1,0 +1,32 @@
+{
+  "model_type": "RandomForestClassifier",
+  "metric": "f1_churn_pos_label_1",
+  "best_cv_score": 0.9993936394812113,
+  "top_features": [
+    {
+      "rank": 1,
+      "feature": "numeric_plain__support_calls",
+      "importance": 0.2889928292053319
+    },
+    {
+      "rank": 2,
+      "feature": "numeric_clip__total_spend",
+      "importance": 0.20698860641095304
+    },
+    {
+      "rank": 3,
+      "feature": "numeric_plain__age",
+      "importance": 0.1368211398502941
+    },
+    {
+      "rank": 4,
+      "feature": "numeric_clip__payment_delay",
+      "importance": 0.12364294299314355
+    },
+    {
+      "rank": 5,
+      "feature": "categorical__contract_length_Monthly",
+      "importance": 0.11470728272453985
+    }
+  ]
+}
