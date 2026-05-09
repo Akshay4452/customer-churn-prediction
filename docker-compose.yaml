@@ -1,0 +1,48 @@
+# FastAPI + Streamlit stack (Phase 4.3)
+# Copy `.env.example` to `.env` and set LLM keys before `docker compose up --build`.
+
+services:
+  api:
+    build: .
+    image: churn-service:latest
+    command:
+      - uvicorn
+      - churn_service.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "8000:8000"
+    # Optional: create `.env` with OPENAI_API_KEY / OPENROUTER_API_KEY and run:
+    #   docker compose --env-file .env up --build
+    environment:
+      HIGH_RISK_THRESHOLD: "0.5"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  ui:
+    image: churn-service:latest
+    build: .
+    command:
+      - streamlit
+      - run
+      - app_ui.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+      - --browser.gatherUsageStats=false
+    ports:
+      - "8501:8501"
+    environment:
+      API_BASE_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
